@@ -2,7 +2,15 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracterror, Address, BytesN, Env, Vec, Symbol, Map};
+use soroban_sdk::{
+    contract, contractimpl, contracterror, contracttype, contractmeta,
+    symbol_short, Address, BytesN, Env, Vec, Symbol, Map, token
+};
+
+contractmeta!(
+    key = "description",
+    val = "Secure Multi-signature Wallet Contract"
+);
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -17,20 +25,28 @@ pub enum MultisigError {
     InvalidOwner = 7,
     ArithmeticError = 8,
     DuplicateOwner = 9,
+    AlreadyInitialized = 10,
+    InvalidAmount = 11,
+    InvalidAddress = 12,
+    TokenTransferFailed = 13,
 }
 
 #[contract]
 pub struct MultisigContract;
 
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct Transaction {
     pub to: Address,
     pub amount: i128,
+    pub token: Address,
     pub data: BytesN<32>,
     pub executed: bool,
     pub approvals: u32,
+    pub submitter: Address,
 }
 
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct MultisigConfig {
     pub owners: Vec<Address>,
@@ -38,23 +54,22 @@ pub struct MultisigConfig {
     pub transaction_count: u32,
 }
 
-const CONFIG_KEY: &Symbol = &Symbol::new("config");
-const TX_KEY: &Symbol = &Symbol::new("tx");
-const APPROVAL_KEY: &Symbol = &Symbol::new("approval");
+const CONFIG_KEY: Symbol = symbol_short!("config");
+const TX_KEY: Symbol = symbol_short!("tx");
+const APPROVAL_KEY: Symbol = symbol_short!("approval");
 
 #[contractimpl]
 impl MultisigContract {
+
     pub fn initialize(
         env: Env,
         owners: Vec<Address>,
         required_approvals: u32,
     ) -> Result<(), MultisigError> {
-        // Check if already initialized
-        if env.storage().persistent().has(CONFIG_KEY) {
-            panic!("Contract already initialized");
+        if env.storage().persistent().has(&CONFIG_KEY) {
+            return Err(MultisigError::AlreadyInitialized);
         }
 
-        // Validate inputs
         if owners.is_empty() {
             return Err(MultisigError::InvalidOwner);
         }
@@ -63,13 +78,12 @@ impl MultisigContract {
             return Err(MultisigError::InvalidThreshold);
         }
 
-        // Check for duplicate owners
         let mut seen = Map::new(&env);
         for owner in owners.iter() {
-            if seen.contains_key(owner) {
+            if seen.contains_key(owner.clone()) {
                 return Err(MultisigError::DuplicateOwner);
             }
-            seen.set(owner, true);
+            seen.set(owner.clone(), true);
         }
 
         let config = MultisigConfig {
@@ -78,16 +92,18 @@ impl MultisigContract {
             transaction_count: 0,
         };
 
-        env.storage().persistent().set(CONFIG_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
+        
+        env.events().publish((symbol_short!("init"), owners.len(), required_approvals), ());
+        
         Ok(())
     }
 
-    fn only_owner(env: &Env) -> Result<(), MultisigError> {
-        let caller = env.invoker();
-        let config: MultisigConfig = env.storage().persistent().get(CONFIG_KEY)
+    fn verify_owner(env: &Env, caller: &Address) -> Result<(), MultisigError> {
+        let config: MultisigConfig = env.storage().persistent().get(&CONFIG_KEY)
             .ok_or(MultisigError::Unauthorized)?;
         
-        if !config.owners.contains(&caller) {
+        if !config.owners.contains(caller) {
             return Err(MultisigError::Unauthorized);
         }
         
@@ -95,19 +111,35 @@ impl MultisigContract {
     }
 
     fn get_config(env: &Env) -> Result<MultisigConfig, MultisigError> {
-        env.storage().persistent().get(CONFIG_KEY)
+        env.storage().persistent().get(&CONFIG_KEY)
             .ok_or(MultisigError::Unauthorized)
     }
 
+    fn validate_transaction_inputs(
+        _to: &Address,
+        amount: i128,
+        _token: &Address,
+    ) -> Result<(), MultisigError> {
+        if amount <= 0 {
+            return Err(MultisigError::InvalidAmount);
+        }
+        
+        Ok(())
+    }
+
+ 
     pub fn submit_transaction(
         env: Env,
+        caller: Address,
         to: Address,
         amount: i128,
+        token: Address,
         data: BytesN<32>,
     ) -> Result<u32, MultisigError> {
-        // Authentication check
-        Address::require_auth(&env.invoker());
-        Self::only_owner(&env)?;
+        caller.require_auth();
+        Self::verify_owner(&env, &caller)?;
+        
+        Self::validate_transaction_inputs(&to, amount, &token)?;
         
         let mut config = Self::get_config(&env)?;
         
@@ -115,71 +147,84 @@ impl MultisigContract {
             .ok_or(MultisigError::ArithmeticError)?;
         
         let transaction = Transaction {
-            to,
+            to: to.clone(),
             amount,
+            token: token.clone(),
             data,
             executed: false,
-            approvals: 1, // Submitter auto-approves
+            approvals: 1, 
+            submitter: caller.clone(),
         };
 
-        // Update state BEFORE any external interactions
         config.transaction_count = new_count;
-        env.storage().persistent().set(CONFIG_KEY, &config);
+        env.storage().persistent().set(&CONFIG_KEY, &config);
         
-        // Store transaction
         env.storage().persistent().set(&(TX_KEY, new_count), &transaction);
         
-        // Store approval for submitter
         let mut approvals = Vec::new(&env);
-        approvals.push_back(env.invoker());
+        approvals.push_back(caller.clone());
         env.storage().persistent().set(&(APPROVAL_KEY, new_count), &approvals);
+
+        env.events().publish(
+            (symbol_short!("submit"), new_count),
+            (caller, to, amount, token)
+        );
 
         Ok(new_count)
     }
 
-    pub fn approve_transaction(env: Env, transaction_id: u32) -> Result<(), MultisigError> {
-        // Authentication check
-        Address::require_auth(&env.invoker());
-        Self::only_owner(&env)?;
 
-        let tx_key = &(TX_KEY, transaction_id);
-        let mut transaction: Transaction = env.storage().persistent().get(tx_key)
+    pub fn approve_transaction(
+        env: Env, 
+        caller: Address,
+        transaction_id: u32
+    ) -> Result<(), MultisigError> {
+        caller.require_auth();
+        Self::verify_owner(&env, &caller)?;
+
+        let tx_key = (TX_KEY, transaction_id);
+        let mut transaction: Transaction = env.storage().persistent().get(&tx_key)
             .ok_or(MultisigError::TransactionNotFound)?;
 
         if transaction.executed {
             return Err(MultisigError::TransactionExecuted);
         }
 
-        // Check if already approved
-        let approval_key = &(APPROVAL_KEY, transaction_id);
-        let mut approvals: Vec<Address> = env.storage().persistent().get(approval_key)
+        let approval_key = (APPROVAL_KEY, transaction_id);
+        let mut approvals: Vec<Address> = env.storage().persistent().get(&approval_key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        if approvals.contains(&env.invoker()) {
+        if approvals.contains(&caller) {
             return Err(MultisigError::AlreadyApproved);
         }
 
-        // Safe arithmetic for approvals count
         let new_approvals = transaction.approvals.checked_add(1)
             .ok_or(MultisigError::ArithmeticError)?;
         
-        // Update state BEFORE any external interactions
         transaction.approvals = new_approvals;
-        env.storage().persistent().set(tx_key, &transaction);
+        env.storage().persistent().set(&tx_key, &transaction);
         
-        approvals.push_back(env.invoker());
-        env.storage().persistent().set(approval_key, &approvals);
+        approvals.push_back(caller.clone());
+        env.storage().persistent().set(&approval_key, &approvals);
+
+        env.events().publish(
+            (symbol_short!("approve"), transaction_id),
+            (caller, new_approvals)
+        );
 
         Ok(())
     }
 
-    pub fn execute_transaction(env: Env, transaction_id: u32) -> Result<(), MultisigError> {
-        // Authentication check
-        Address::require_auth(&env.invoker());
-        Self::only_owner(&env)?;
+    pub fn execute_transaction(
+        env: Env, 
+        caller: Address,
+        transaction_id: u32
+    ) -> Result<(), MultisigError> {
+        caller.require_auth();
+        Self::verify_owner(&env, &caller)?;
 
-        let tx_key = &(TX_KEY, transaction_id);
-        let mut transaction: Transaction = env.storage().persistent().get(tx_key)
+        let tx_key = (TX_KEY, transaction_id);
+        let mut transaction: Transaction = env.storage().persistent().get(&tx_key)
             .ok_or(MultisigError::TransactionNotFound)?;
 
         if transaction.executed {
@@ -192,42 +237,41 @@ impl MultisigContract {
             return Err(MultisigError::InsufficientApprovals);
         }
 
-        // Update state BEFORE external call (Check-Effects-Interaction pattern)
         transaction.executed = true;
-        env.storage().persistent().set(tx_key, &transaction);
+        env.storage().persistent().set(&tx_key, &transaction);
 
-        // Here you would typically make the external call to transfer funds
-        // For now, we'll just mark it as executed
-        // In production: token_client.transfer(&env.invoker(), &transaction.to, &transaction.amount);
+        let token_client = token::Client::new(&env, &transaction.token);
+        
 
-        Ok(())
-    }
-
-    // Administrative functions
-    pub fn update_threshold(env: Env, new_threshold: u32) -> Result<(), MultisigError> {
-        Address::require_auth(&env.invoker());
-        Self::only_owner(&env)?;
-
-        let mut config = Self::get_config(&env)?;
-
-        if new_threshold == 0 || new_threshold > config.owners.len() as u32 {
-            return Err(MultisigError::InvalidThreshold);
+        match token_client.try_transfer(
+            &env.current_contract_address(),
+            &transaction.to,
+            &transaction.amount
+        ) {
+            Ok(_) => {
+                env.events().publish(
+                    (symbol_short!("execute"), transaction_id),
+                    (caller, transaction.to.clone(), transaction.amount, transaction.token.clone())
+                );
+                Ok(())
+            },
+            Err(_) => {
+                transaction.executed = false;
+                env.storage().persistent().set(&tx_key, &transaction);
+                Err(MultisigError::TokenTransferFailed)
+            }
         }
-
-        config.required_approvals = new_threshold;
-        env.storage().persistent().set(CONFIG_KEY, &config);
-
-        Ok(())
     }
 
-    // View functions
-    pub fn get_config(env: Env) -> Result<MultisigConfig, MultisigError> {
-        Self::only_owner(&env)?;
-        Self::get_config(&env)
-    }
 
-    pub fn get_transaction(env: Env, transaction_id: u32) -> Result<Transaction, MultisigError> {
-        Self::only_owner(&env)?;
+    
+    pub fn get_transaction(
+        env: Env,
+        caller: Address,
+        transaction_id: u32
+    ) -> Result<Transaction, MultisigError> {
+        caller.require_auth();
+        Self::verify_owner(&env, &caller)?;
         env.storage().persistent().get(&(TX_KEY, transaction_id))
             .ok_or(MultisigError::TransactionNotFound)
     }
@@ -237,9 +281,15 @@ impl MultisigContract {
         Ok(config.owners.contains(&address))
     }
 
-    pub fn get_approvals(env: Env, transaction_id: u32) -> Result<Vec<Address>, MultisigError> {
-        Self::only_owner(&env)?;
+    pub fn get_approvals(
+        env: Env,
+        caller: Address,
+        transaction_id: u32
+    ) -> Result<Vec<Address>, MultisigError> {
+        caller.require_auth();
+        Self::verify_owner(&env, &caller)?;
         env.storage().persistent().get(&(APPROVAL_KEY, transaction_id))
             .ok_or(MultisigError::TransactionNotFound)
     }
+
 }
